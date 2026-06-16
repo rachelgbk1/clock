@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Selenicereus — a clock</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { position: absolute; inset: 0; }
+    #phase-line {
+      position: absolute;
+      bottom: 32px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      font-family: 'Georgia', serif;
+      font-style: italic;
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      color: rgba(255,255,255,0.2);
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    #day-counter {
+      position: absolute;
+      z-index: 10;
+      bottom: 32px;
+      right: 36px;
+      text-align: right;
+      pointer-events: none;
+    }
+    #day-counter .label {
+      display: block;
+      font-family: 'Courier New', monospace;
+      font-size: 9px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.15);
+    }
+    #day-counter .count {
+      display: block;
+      font-family: 'Georgia', serif;
+      font-size: 30px;
+      color: rgba(255,255,255,0.1);
+      line-height: 1;
+      margin-top: 4px;
+    }
+    #species {
+      position: absolute;
+      z-index: 10;
+      bottom: 32px;
+      left: 36px;
+      pointer-events: none;
+    }
+    #species .name {
+      display: block;
+      font-family: 'Georgia', serif;
+      font-style: italic;
+      font-size: 11px;
+      color: rgba(255,255,255,0.15);
+      letter-spacing: 0.06em;
+    }
+    #species .sub {
+      display: block;
+      font-family: 'Courier New', monospace;
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.08);
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="phase-line"></div>
+  <div id="day-counter">
+    <span class="label">blooms survived</span>
+    <span class="count" id="bloom-count">0</span>
+  </div>
+  <div id="species">
+    <span class="name">Selenicereus grandiflorus</span>
+    <span class="sub">Queen of the Night</span>
+  </div>
+
+  <script>
+  (function () {
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const phaseEl = document.getElementById('phase-line');
+    const bloomEl = document.getElementById('bloom-count');
+    const STORAGE_KEY = 'selenicereus_v2';
+
+    // --- PERSISTENT STATE ---
+    function loadState() {
+      try { const r = localStorage.getItem(STORAGE_KEY); if (r) return JSON.parse(r); } catch(e) {}
+      return { bloomCount: 0, petals: [], lastDate: null };
+    }
+    function saveState() {
+      try {
+        const s = { ...state, petals: state.petals.slice(-300) };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+      } catch(e) {}
+    }
+
+    let state = loadState();
+    let W, H, CX, GY;
+
+    function resize() {
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+      CX = W / 2;
+      GY = H - Math.round(H * 0.07);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    function lerp(a, b, t) { return a + (b - a) * t; }
+    function ease(t) { return t < 0.5 ? 2*t*t : -1+(4-2*t)*t; }
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    // LIFE PROGRESS — 0 at midnight, grows to 1 at noon, falls back to 0 at midnight
+    function lifeProgress(secs) {
+      // 0:00 = 0, 12:00 = 1, 23:59 = ~0
+      if (secs <= 43200) {
+        return secs / 43200;          // midnight → noon: growing 0→1
+      } else {
+        return 1 - (secs - 43200) / 43200; // noon → midnight: dying 1→0
+      }
+    }
+
+    // --- PHASES (keyed to corrected direction) ---
+    const PHASES = [
+      [0,    0.05,  'dormant'],
+      [0.05, 0.18,  'the first tendril emerges'],
+      [0.18, 0.38,  'reaching for light'],
+      [0.38, 0.55,  'a bud forms'],
+      [0.55, 0.75,  'opening'],
+      [0.75, 0.92,  'full bloom'],
+      // death phases — triggered when dying (pm side)
+    ];
+    const DEATH_PHASES = [
+      [0.92, 1.01, 'full bloom'],
+      [0.72, 0.92, 'the petals begin to fall'],
+      [0.45, 0.72, 'withdrawing'],
+      [0.18, 0.45, 'returning to the ground'],
+      [0,    0.18, 'dormant'],
+    ];
+    function getPhase(p, isAM) {
+      const list = isAM ? PHASES : DEATH_PHASES;
+      for (const [lo, hi, text] of list) {
+        if (p >= lo && p < hi) return text;
+      }
+      return '';
+    }
+
+    // --- FALLEN PETALS ---
+    let saveTimer = null;
+    function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(saveState, 2000); }
+
+    let lastPetalTime = 0;
+
+    function spawnPetal(cx, cy, p) {
+      const intensity = clamp((1 - p) / 0.55, 0, 1); // more as it dies
+      state.petals.push({
+        x: cx + (Math.random() - 0.5) * 50,
+        y: cy,
+        tx: cx + (Math.random() - 0.5) * W * 0.35,
+        ty: GY - 2 - Math.random() * 8,
+        rot: Math.random() * Math.PI * 2,
+        size: 8 + Math.random() * 10,
+        alpha: 0.55 + intensity * 0.25,
+        settled: false,
+        day: state.bloomCount
+      });
+      scheduleSave();
+    }
+
+    function drawFallenPetals(now) {
+      const t = now * 0.001;
+      state.petals.forEach(fp => {
+        if (!fp.settled) {
+          fp.x = lerp(fp.x, fp.tx, 0.014);
+          fp.y = lerp(fp.y, fp.ty, 0.011);
+          fp.rot += 0.022;
+          if (Math.abs(fp.x - fp.tx) < 1.2 && Math.abs(fp.y - fp.ty) < 1.2) fp.settled = true;
+        }
+        const sway = fp.settled ? Math.sin(t * 0.35 + fp.rot) * 1.5 : 0;
+        ctx.save();
+        ctx.translate(fp.x + sway, fp.y);
+        ctx.rotate(fp.rot);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, fp.size * 0.3, fp.size, 0, 0, Math.PI * 2);
+        // Deep dark red, almost maroon
+        ctx.fillStyle = `rgba(120,18,18,${fp.alpha})`;
+        ctx.fill();
+        ctx.restore();
+      });
+    }
+
+    // --- GROUND LINE ---
+    function drawGround(p) {
+      // Thin ground line, nearly invisible — just enough to root the stem
+      ctx.fillStyle = `rgba(20,20,20,1)`;
+      ctx.fillRect(0, GY, W, H - GY);
+      // Subtle ground edge
+      ctx.beginPath();
+      ctx.moveTo(0, GY);
+      ctx.lineTo(W, GY);
+      ctx.strokeStyle = `rgba(255,255,255,0.04)`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // --- STEM ---
+    function drawStem(p, now) {
+      if (p < 0.02) return null;
+      const stemH = ease(clamp(p * 1.2, 0, 1)) * Math.min(H * 0.50, 260);
+      const sway = Math.sin(now * 0.0008) * 7 * Math.min(p, 1);
+      const topX = CX + sway;
+      const topY = GY - stemH;
+
+      // Deep green, almost black at base
+      const g = ctx.createLinearGradient(CX, GY, topX, topY);
+      g.addColorStop(0, `rgba(8,28,10,${Math.min(p * 2, 1)})`);
+      g.addColorStop(0.5, `rgba(18,55,22,${Math.min(p * 2, 1)})`);
+      g.addColorStop(1, `rgba(30,80,35,${Math.min(p * 2, 1)})`);
+
+      ctx.beginPath();
+      ctx.moveTo(CX, GY);
+      ctx.quadraticCurveTo(CX + sway * 0.4, (GY + topY) / 2, topX, topY);
+      ctx.lineWidth = Math.max(2, 5 * Math.min(p * 1.3, 1));
+      ctx.strokeStyle = g;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+
+      // Two leaves — sparse, structural
+      if (p > 0.2) drawLeaf(CX + sway * 0.3, GY - stemH * 0.35, -1, Math.min((p-0.2)/0.3,1), now);
+      if (p > 0.32) drawLeaf(CX + sway * 0.62, GY - stemH * 0.6, 1, Math.min((p-0.32)/0.3,1), now);
+
+      return { x: topX, y: topY };
+    }
+
+    function drawLeaf(lx, ly, dir, lp, now) {
+      const lw = 38 * lp, lh = 16 * lp;
+      ctx.save();
+      ctx.translate(lx, ly);
+      ctx.rotate(dir * (Math.PI / 5.2 + Math.sin(now * 0.0007) * 0.04));
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.bezierCurveTo(dir*lw*0.4, -lh*0.8, dir*lw*0.9, -lh*0.45, dir*lw, -lh*0.2);
+      ctx.bezierCurveTo(dir*lw*0.85, lh*0.15, dir*lw*0.4, lh*0.3, 0, 0);
+      // Dark olive green
+      ctx.fillStyle = `rgba(22,52,24,${lp * 0.9})`;
+      ctx.fill();
+      ctx.strokeStyle = `rgba(35,70,38,${lp * 0.5})`;
+      ctx.lineWidth = 0.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // --- FLOWER ---
+    function drawFlower(cx, cy, p, isAM, secs, now) {
+      if (p < 0.06) return;
+      const fp = Math.max(0, (p - 0.06) / 0.94);
+      const N = 12;
+      const maxL = Math.min(H * 0.17, 90);
+      const petalL = ease(fp) * maxL;
+      const petalW = ease(fp) * 26;
+      const spin = secs * 0.006;
+
+      for (let i = 0; i < N; i++) {
+        const angle = (i / N) * Math.PI * 2 + spin;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(angle);
+
+        // During bloom: very dark crimson-maroon
+        // During growth: starts even darker, builds to deep red
+        let pr = 100, pg = 8, pb = 8;
+        if (isAM) {
+          // Growing — reddens as it opens
+          pr = Math.round(lerp(40, 110, fp));
+          pg = Math.round(lerp(5, 10, fp));
+          pb = Math.round(lerp(5, 10, fp));
+        } else {
+          // Dying — darkens back toward near-black
+          pr = Math.round(lerp(110, 30, 1 - p));
+          pg = Math.round(lerp(10, 4, 1 - p));
+          pb = Math.round(lerp(10, 4, 1 - p));
+        }
+
+        const pg2 = ctx.createLinearGradient(0, 0, 0, -petalL);
+        pg2.addColorStop(0,    `rgba(${pr},${pg},${pb},${fp * 0.08})`);
+        pg2.addColorStop(0.4,  `rgba(${pr},${pg},${pb},${fp * 0.75})`);
+        pg2.addColorStop(1,    `rgba(${pr},${pg},${pb},${fp * 0.2})`);
+
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.bezierCurveTo(-petalW*0.5, -petalL*0.3, -petalW, -petalL*0.72, 0, -petalL);
+        ctx.bezierCurveTo( petalW, -petalL*0.72,  petalW*0.5, -petalL*0.3, 0, 0);
+        ctx.fillStyle = pg2;
+        ctx.fill();
+        ctx.strokeStyle = `rgba(${pr},${pg},${pb},${fp * 0.55})`;
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Spawn falling petals during PM death phase
+      if (!isAM && p < 0.88) {
+        const urgency = clamp((0.88 - p) / 0.88, 0, 1);
+        const interval = lerp(3000, 400, urgency);
+        if (now - lastPetalTime > interval) {
+          spawnPetal(cx, cy, p);
+          lastPetalTime = now;
+        }
+      }
+
+      // Core — near-black center with a very dark red corona
+      const coreR = ease(fp) * 16;
+      const cg = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreR);
+      cg.addColorStop(0,   `rgba(60,6,6,${fp})`);
+      cg.addColorStop(0.6, `rgba(40,4,4,${fp * 0.7})`);
+      cg.addColorStop(1,   `rgba(20,2,2,0)`);
+      ctx.beginPath();
+      ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
+      ctx.fillStyle = cg;
+      ctx.fill();
+
+      // Tight pollen ring — very subtle gold
+      if (fp > 0.35) {
+        for (let i = 0; i < 8; i++) {
+          const a = (i / 8) * Math.PI * 2 + spin * 2;
+          ctx.beginPath();
+          ctx.arc(cx + Math.cos(a)*coreR*0.55, cy + Math.sin(a)*coreR*0.55, 1.2, 0, Math.PI*2);
+          ctx.fillStyle = `rgba(180,130,20,${fp * 0.6})`;
+          ctx.fill();
+        }
+      }
+    }
+
+    // --- BLOOM COUNT ---
+    let lastDateKey = null;
+    function checkBloom(secs) {
+      const d = new Date();
+      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      if (lastDateKey && key !== lastDateKey) {
+        state.bloomCount++;
+        state.petals = state.petals.filter(fp => fp.day >= state.bloomCount - 4);
+        scheduleSave();
+      }
+      lastDateKey = key;
+    }
+
+    // --- MAIN LOOP ---
+    function frame(now) {
+      const d = new Date();
+      const h = d.getHours(), m = d.getMinutes(), s = d.getSeconds();
+      const secs = h * 3600 + m * 60 + s;
+      const isAM = secs <= 43200;
+      const p = lifeProgress(secs);
+
+      checkBloom(secs);
+      phaseEl.textContent = getPhase(p, isAM);
+      bloomEl.textContent = state.bloomCount;
+
+      ctx.clearRect(0, 0, W, H);
+
+      drawFallenPetals(now);
+      drawGround(p);
+      const stem = drawStem(p, now);
+      if (stem) drawFlower(stem.x, stem.y, p, isAM, secs, now);
+
+      requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
