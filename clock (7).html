@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Selenicereus — a clock</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { position: absolute; inset: 0; }
+    #phase-line {
+      position: absolute;
+      bottom: 32px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      font-family: 'Georgia', serif;
+      font-style: italic;
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      color: rgba(255,255,255,0.25);
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    #species {
+      position: absolute;
+      z-index: 10;
+      bottom: 32px;
+      left: 36px;
+      pointer-events: none;
+    }
+    #species .name {
+      display: block;
+      font-family: 'Georgia', serif;
+      font-style: italic;
+      font-size: 11px;
+      color: rgba(255,255,255,0.2);
+      letter-spacing: 0.06em;
+    }
+    #species .sub {
+      display: block;
+      font-family: 'Courier New', monospace;
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.1);
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="phase-line"></div>
+  <div id="species">
+    <span class="name">Selenicereus grandiflorus</span>
+    <span class="sub">Queen of the Night</span>
+  </div>
+
+  <script>
+  (function () {
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const phaseEl = document.getElementById('phase-line');
+    const STORAGE_KEY = 'selenicereus_v5';
+
+    // --- PERSISTENT STATE ---
+    function loadState() {
+      try { const r = localStorage.getItem(STORAGE_KEY); if (r) return JSON.parse(r); } catch(e) {}
+      return { bloomCount: 0, petals: [], lastDate: null };
+    }
+    function saveState() {
+      try {
+        const s = { ...state, petals: state.petals.slice(-300) };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+      } catch(e) {}
+    }
+
+    let state = loadState();
+    let W, H, CX, GY;
+
+    function resize() {
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+      CX = W / 2;
+      GY = H - Math.round(H * 0.07);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+    seedMissedPetals();
+
+    function lerp(a, b, t) { return a + (b - a) * t; }
+    function ease(t) { return t < 0.5 ? 2*t*t : -1+(4-2*t)*t; }
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+    function lerpColor(c1, c2, t) {
+      return [
+        Math.round(lerp(c1[0], c2[0], t)),
+        Math.round(lerp(c1[1], c2[1], t)),
+        Math.round(lerp(c1[2], c2[2], t))
+      ];
+    }
+    function rgb(c, a) {
+      return a !== undefined
+        ? `rgba(${c[0]},${c[1]},${c[2]},${a})`
+        : `rgb(${c[0]},${c[1]},${c[2]})`;
+    }
+
+    // --- SKY COLOUR KEYFRAMES (hour → [top colour, bottom colour]) ---
+    // Hours as fractions of 24 (0=midnight, 0.5=noon, 1=midnight)
+    const SKY = [
+      // time,  top rgb,           bottom rgb
+      [0.000,  [8,  10, 35],      [4,   5, 18]],   // midnight — deep navy
+      [0.208,  [10, 14, 42],      [5,   7, 22]],   // 5am — still dark
+      [0.250,  [35, 25, 65],      [18, 15, 40]],   // 6am — pre-dawn purple
+      [0.292,  [190,90, 55],      [130, 55, 30]],  // 7am — sunrise orange
+      [0.333,  [220,140, 60],     [180,100, 40]],  // 8am — warm gold
+      [0.417,  [100,160,220],     [60, 110,180]],  // 10am — morning blue
+      [0.500,  [80, 140,210],     [50,  95,170]],  // noon — bright day
+      [0.583,  [90, 150,215],     [55, 105,175]],  // 2pm — afternoon
+      [0.667,  [200,120, 60],     [160, 80, 35]],  // 4pm — golden hour
+      [0.708,  [220, 80, 45],     [160, 50, 30]],  // 5pm — sunset red
+      [0.750,  [140, 50, 60],     [80,  25, 40]],  // 6pm — dusk magenta
+      [0.792,  [45,  25, 65],     [20,  10, 38]],  // 7pm — twilight purple
+      [0.833,  [12,  10, 40],     [6,   5, 22]],   // 8pm — night falling
+      [0.875,  [8,   9, 32],      [4,   4, 16]],   // 9pm — deep night
+      [1.000,  [8,  10, 35],      [4,   5, 18]],   // midnight again
+    ];
+
+    function getSkyColors(fracOfDay) {
+      // fracOfDay: 0.0 = midnight, 0.5 = noon, 1.0 = midnight
+      let i = 0;
+      for (let k = 0; k < SKY.length - 1; k++) {
+        if (fracOfDay >= SKY[k][0] && fracOfDay <= SKY[k+1][0]) { i = k; break; }
+      }
+      const span = SKY[i+1][0] - SKY[i][0];
+      const t = span === 0 ? 0 : (fracOfDay - SKY[i][0]) / span;
+      return {
+        top: lerpColor(SKY[i][1], SKY[i+1][1], t),
+        bot: lerpColor(SKY[i][2], SKY[i+1][2], t)
+      };
+    }
+
+    function drawSky(frac) {
+      const { top, bot } = getSkyColors(frac);
+      const grad = ctx.createLinearGradient(0, 0, 0, GY);
+      grad.addColorStop(0, rgb(top));
+      grad.addColorStop(1, rgb(bot));
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, W, GY);
+    }
+
+    // --- STARS ---
+    const stars = Array.from({length: 120}, () => ({
+      x: Math.random() * 1,
+      y: Math.random() * 0.7,
+      r: Math.random() * 1.1 + 0.2,
+      phase: Math.random() * Math.PI * 2
+    }));
+
+    function nightness(frac) {
+      // bright at night (frac near 0 or 1), zero at midday
+      // night: frac < 0.25 or frac > 0.79
+      if (frac < 0.208) return 1;
+      if (frac < 0.292) return 1 - (frac - 0.208) / 0.084;
+      if (frac > 0.833) return (frac - 0.833) / 0.167;
+      return 0;
+    }
+
+    function drawStars(frac, now) {
+      const n = nightness(frac);
+      if (n < 0.01) return;
+      const t = now * 0.001;
+      stars.forEach(s => {
+        const tw = 0.6 + 0.4 * Math.sin(s.phase + t * 0.8);
+        ctx.beginPath();
+        ctx.arc(s.x * W, s.y * H, s.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255,255,255,${n * tw * 0.8})`;
+        ctx.fill();
+      });
+    }
+
+    // --- SUN ---
+    function drawSun(frac) {
+      // Sun visible from ~6am (0.25) to ~7pm (0.708)
+      if (frac < 0.25 || frac > 0.71) return;
+      const t = (frac - 0.25) / (0.71 - 0.25); // 0=sunrise, 1=sunset
+      // arc across the sky
+      const sx = lerp(W * 0.08, W * 0.92, t);
+      const sy = GY * 0.15 + Math.sin(t * Math.PI) * -(GY * 0.55);
+      const warmth = t < 0.5 ? t * 2 : 2 - t * 2; // 0 at edges, 1 at noon
+      const r = 22 + warmth * 6;
+      // glow
+      const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 3);
+      grd.addColorStop(0, `rgba(255,${Math.round(lerp(180,240,warmth))},${Math.round(lerp(60,120,warmth))},0.25)`);
+      grd.addColorStop(1, 'rgba(255,200,80,0)');
+      ctx.beginPath();
+      ctx.arc(sx, sy, r * 3, 0, Math.PI * 2);
+      ctx.fillStyle = grd;
+      ctx.fill();
+      // disc
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,${Math.round(lerp(185,240,warmth))},${Math.round(lerp(60,120,warmth))},0.92)`;
+      ctx.fill();
+    }
+
+    // --- MOON ---
+    function drawMoon(frac) {
+      // Moon visible from ~7pm (0.79) through midnight to ~6am (0.25)
+      const n = nightness(frac);
+      if (n < 0.05) return;
+      // Moon arcs oppositely — rises at dusk, highest at midnight, sets at dawn
+      let moonT;
+      if (frac >= 0.792) moonT = (frac - 0.792) / (1 - 0.792) * 0.5;
+      else moonT = 0.5 + frac / 0.208 * 0.5;
+      moonT = clamp(moonT, 0, 1);
+      const mx = lerp(W * 0.1, W * 0.9, moonT);
+      const my = GY * 0.12 + Math.sin(moonT * Math.PI) * -(GY * 0.45);
+      // crescent — draw circle then cut
+      ctx.beginPath();
+      ctx.arc(mx, my, 15, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(215,215,180,${n * 0.88})`;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(mx + 9, my - 3, 12, 0, Math.PI * 2);
+      // use composite to cut crescent
+      ctx.fillStyle = `rgba(0,0,0,${n * 0.92})`;
+      ctx.fill();
+      // soft glow
+      const mg = ctx.createRadialGradient(mx, my, 0, mx, my, 35);
+      mg.addColorStop(0, `rgba(200,200,160,${n * 0.12})`);
+      mg.addColorStop(1, 'rgba(200,200,160,0)');
+      ctx.beginPath();
+      ctx.arc(mx, my, 35, 0, Math.PI * 2);
+      ctx.fillStyle = mg;
+      ctx.fill();
+    }
+
+    // --- LIFE PROGRESS ---
+    // noon=0 (dormant), midnight=1 (full bloom)
+    function lifeProgress(secs) {
+      if (secs >= 43200) return (secs - 43200) / 43200;  // noon→midnight: 0→1
+      else return 1 - (secs / 43200);                    // midnight→noon: 1→0
+    }
+
+    // --- PHASES ---
+    const GROW_PHASES = [
+      [0,    0.05, 'dormant'],
+      [0.05, 0.18, 'the first tendril emerges'],
+      [0.18, 0.38, 'reaching for light'],
+      [0.38, 0.55, 'a bud forms'],
+      [0.55, 0.75, 'opening'],
+      [0.75, 0.95, 'blooming in the dark'],
+      [0.95, 1.01, 'full bloom — for one night'],
+    ];
+    const DEATH_PHASES = [
+      [0.88, 1.01, 'full bloom — fading'],
+      [0.65, 0.88, 'the petals begin to fall'],
+      [0.38, 0.65, 'withdrawing'],
+      [0.14, 0.38, 'returning to the ground'],
+      [0,    0.14, 'dormant until dusk'],
+    ];
+    function getPhase(p, growing) {
+      const list = growing ? GROW_PHASES : DEATH_PHASES;
+      for (const [lo, hi, text] of list) if (p >= lo && p < hi) return text;
+      return '';
+    }
+
+    // --- FALLEN PETALS ---
+    let saveTimer = null;
+    function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(saveState, 2000); }
+    let lastPetalTime = 0;
+
+    function findFreeSpot() {
+      const minDist = 28;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const tx = CX + (Math.random() - 0.5) * W * 0.55;
+        const ty = GY - 2 - Math.random() * 6;
+        const tooClose = state.petals.some(fp => fp.settled && Math.abs(fp.tx - tx) < minDist);
+        if (!tooClose) return { tx, ty };
+      }
+      return { tx: CX + (Math.random() - 0.5) * W * 0.55, ty: GY - 2 - Math.random() * 6 };
+    }
+
+    function spawnPetal(cx, cy, p, instant) {
+      const intensity = clamp((1 - p) / 0.55, 0, 1);
+      const { tx, ty } = findFreeSpot();
+      state.petals.push({
+        x: instant ? tx : (cx + (Math.random() - 0.5) * 50),
+        y: instant ? ty : cy,
+        tx, ty,
+        rot: Math.random() * Math.PI * 2,
+        size: 7 + Math.random() * 8,
+        alpha: 0.5 + intensity * 0.2,
+        settled: instant ? true : false,
+        day: state.bloomCount
+      });
+      if (!instant) scheduleSave();
+    }
+
+    function seedMissedPetals() {
+      const now = new Date();
+      const secs = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+      if (secs >= 43200) return; // PM — growing, no petals
+      const minutesSinceMidnight = Math.floor(secs / 60);
+      const needed = Math.max(0, minutesSinceMidnight - state.petals.length);
+      for (let i = 0; i < needed; i++) spawnPetal(W / 2, GY, 1 - (i / 720), true);
+      if (needed > 0) saveState();
+    }
+
+    function drawFallenPetals(now) {
+      const t = now * 0.001;
+      state.petals.forEach(fp => {
+        if (!fp.settled) {
+          fp.x = lerp(fp.x, fp.tx, 0.014);
+          fp.y = lerp(fp.y, fp.ty, 0.011);
+          fp.rot += 0.022;
+          if (Math.abs(fp.x - fp.tx) < 1.2 && Math.abs(fp.y - fp.ty) < 1.2) fp.settled = true;
+        }
+        const sway = fp.settled ? Math.sin(t * 0.35 + fp.rot) * 1.5 : 0;
+        ctx.save();
+        ctx.translate(fp.x + sway, fp.y);
+        ctx.rotate(fp.rot);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.bezierCurveTo(-fp.size*0.25, -fp.size*0.3, -fp.size*0.35, -fp.size*0.7, 0, -fp.size);
+        ctx.bezierCurveTo( fp.size*0.35, -fp.size*0.7,  fp.size*0.25, -fp.size*0.3, 0, 0);
+        ctx.fillStyle = `rgba(235,235,228,${fp.alpha})`;
+        ctx.fill();
+        ctx.restore();
+      });
+    }
+
+    // --- GROUND ---
+    function drawGround(frac) {
+      // Ground colour shifts with time of day — brown-green in day, darker at night
+      const n = nightness(frac);
+      const gr = Math.round(lerp(55, 22, n));
+      const gg = Math.round(lerp(72, 38, n));
+      const gb = Math.round(lerp(40, 18, n));
+      ctx.fillStyle = `rgb(${gr},${gg},${gb})`;
+      ctx.fillRect(0, GY, W, H - GY);
+      // horizon line
+      ctx.beginPath();
+      ctx.moveTo(0, GY);
+      ctx.lineTo(W, GY);
+      ctx.strokeStyle = `rgba(255,255,255,0.06)`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // --- STEM ---
+    function drawStem(p, now) {
+      if (p < 0.02) return null;
+      const stemH = ease(clamp(p * 1.2, 0, 1)) * Math.min(H * 0.50, 260);
+      const sway = Math.sin(now * 0.0008) * 7 * Math.min(p, 1);
+      const topX = CX + sway;
+      const topY = GY - stemH;
+      const g = ctx.createLinearGradient(CX, GY, topX, topY);
+      g.addColorStop(0,   `rgba(8,28,10,${Math.min(p*2,1)})`);
+      g.addColorStop(0.5, `rgba(18,55,22,${Math.min(p*2,1)})`);
+      g.addColorStop(1,   `rgba(30,80,35,${Math.min(p*2,1)})`);
+      ctx.beginPath();
+      ctx.moveTo(CX, GY);
+      ctx.quadraticCurveTo(CX + sway*0.4, (GY+topY)/2, topX, topY);
+      ctx.lineWidth = Math.max(2, 5 * Math.min(p*1.3,1));
+      ctx.strokeStyle = g;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+      if (p > 0.2)  drawLeaf(CX+sway*0.3,  GY-stemH*0.35, -1, Math.min((p-0.2)/0.3,1),  now);
+      if (p > 0.32) drawLeaf(CX+sway*0.62, GY-stemH*0.6,   1, Math.min((p-0.32)/0.3,1), now);
+      return { x: topX, y: topY };
+    }
+
+    function drawLeaf(lx, ly, dir, lp, now) {
+      const lw = 38*lp, lh = 16*lp;
+      ctx.save();
+      ctx.translate(lx, ly);
+      ctx.rotate(dir * (Math.PI/5.2 + Math.sin(now*0.0007)*0.04));
+      ctx.beginPath();
+      ctx.moveTo(0,0);
+      ctx.bezierCurveTo(dir*lw*0.4,-lh*0.8, dir*lw*0.9,-lh*0.45, dir*lw,-lh*0.2);
+      ctx.bezierCurveTo(dir*lw*0.85,lh*0.15, dir*lw*0.4,lh*0.3, 0,0);
+      ctx.fillStyle = `rgba(22,52,24,${lp*0.9})`;
+      ctx.fill();
+      ctx.strokeStyle = `rgba(35,70,38,${lp*0.5})`;
+      ctx.lineWidth = 0.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // --- FLOWER ---
+    function drawFlower(cx, cy, p, growing, secs, now) {
+      if (p < 0.06) return;
+      const fp = Math.max(0, (p - 0.06) / 0.94);
+      const spin = secs * 0.004;
+      const maxR = Math.min(H * 0.17, 92);
+      const globalAlpha = growing ? fp : fp * p;
+
+      // Outer spiky sepals — amber-gold
+      const outerN = 18;
+      const outerL = ease(fp) * maxR * 1.35;
+      for (let i = 0; i < outerN; i++) {
+        const angle = (i/outerN)*Math.PI*2 + spin*0.6;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(angle);
+        const tip = -outerL;
+        const cpx = ease(fp) * 5;
+        const cpy = tip * 0.55;
+        const g = ctx.createLinearGradient(0, 0, 0, tip);
+        g.addColorStop(0,   `rgba(160,100,20,${globalAlpha*0.9})`);
+        g.addColorStop(0.5, `rgba(190,130,35,${globalAlpha*0.85})`);
+        g.addColorStop(1,   `rgba(210,165,60,${globalAlpha*0.3})`);
+        ctx.beginPath();
+        ctx.moveTo(0,0);
+        ctx.quadraticCurveTo( cpx, cpy, 0, tip);
+        ctx.quadraticCurveTo(-cpx, cpy, 0, 0);
+        ctx.fillStyle = g;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Inner white petals
+      const innerN = 14;
+      const innerL = ease(fp) * maxR * 0.72;
+      const innerW = ease(fp) * 14;
+      for (let i = 0; i < innerN; i++) {
+        const angle = (i/innerN)*Math.PI*2 + spin*0.9 + Math.PI/innerN;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(angle);
+        const g = ctx.createLinearGradient(0, 0, 0, -innerL);
+        g.addColorStop(0,    `rgba(255,255,250,${globalAlpha*0.07})`);
+        g.addColorStop(0.3,  `rgba(255,255,252,${globalAlpha*0.82})`);
+        g.addColorStop(0.75, `rgba(240,240,235,${globalAlpha*0.65})`);
+        g.addColorStop(1,    `rgba(220,220,215,${globalAlpha*0.15})`);
+        ctx.beginPath();
+        ctx.moveTo(0,0);
+        ctx.bezierCurveTo(-innerW*0.6,-innerL*0.25, -innerW,-innerL*0.65, 0,-innerL);
+        ctx.bezierCurveTo( innerW,-innerL*0.65,  innerW*0.6,-innerL*0.25, 0,0);
+        ctx.fillStyle = g;
+        ctx.fill();
+        ctx.strokeStyle = `rgba(200,200,195,${globalAlpha*0.35})`;
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Spawn petal every 60 seconds during death phase (AM)
+      if (!growing && p < 0.95) {
+        if (now - lastPetalTime > 60000) {
+          spawnPetal(cx, cy, p, false);
+          lastPetalTime = now;
+        }
+      }
+
+      // Stamen cluster
+      if (fp > 0.25) {
+        const stamenCount = 28;
+        const stamenR = ease(fp) * maxR * 0.38;
+        for (let i = 0; i < stamenCount; i++) {
+          const a = (i/stamenCount)*Math.PI*2 + spin*3;
+          const spread = stamenR * (0.3 + (i%3)*0.22);
+          const ex = cx + Math.cos(a)*spread;
+          const ey = cy + Math.sin(a)*spread;
+          ctx.beginPath();
+          ctx.moveTo(cx, cy);
+          ctx.lineTo(ex, ey);
+          ctx.strokeStyle = `rgba(240,240,230,${globalAlpha*0.45})`;
+          ctx.lineWidth = 0.6;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(ex, ey, 1.4, 0, Math.PI*2);
+          ctx.fillStyle = `rgba(220,175,50,${globalAlpha*0.85})`;
+          ctx.fill();
+        }
+      }
+
+      // Core glow
+      const coreR = ease(fp) * 14;
+      const cg = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreR*2.5);
+      cg.addColorStop(0,   `rgba(255,255,245,${globalAlpha*0.95})`);
+      cg.addColorStop(0.4, `rgba(240,235,210,${globalAlpha*0.6})`);
+      cg.addColorStop(1,   `rgba(200,190,160,0)`);
+      ctx.beginPath();
+      ctx.arc(cx, cy, coreR*2.5, 0, Math.PI*2);
+      ctx.fillStyle = cg;
+      ctx.fill();
+    }
+
+    // --- BLOOM COUNT ---
+    let lastDateKey = null;
+    function checkBloom(secs) {
+      const d = new Date();
+      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      if (lastDateKey && key !== lastDateKey) {
+        state.bloomCount++;
+        state.petals = state.petals.filter(fp => fp.day >= state.bloomCount - 4);
+        scheduleSave();
+      }
+      lastDateKey = key;
+    }
+
+    // --- MAIN LOOP ---
+    function frame(now) {
+      const d = new Date();
+      const h = d.getHours(), m = d.getMinutes(), s = d.getSeconds();
+      const secs = h*3600 + m*60 + s;
+      const frac = secs / 86400; // 0.0–1.0 across full day
+      const growing = secs >= 43200; // PM = growing toward midnight
+      const p = lifeProgress(secs);
+
+      checkBloom(secs);
+      phaseEl.textContent = getPhase(p, growing);
+
+      ctx.clearRect(0, 0, W, H);
+
+      // Sky layers
+      drawSky(frac);
+      drawStars(frac, now);
+      drawMoon(frac);
+      drawSun(frac);
+
+      // Ground + plant
+      drawFallenPetals(now);
+      drawGround(frac);
+      const stem = drawStem(p, now);
+      if (stem) drawFlower(stem.x, stem.y, p, growing, secs, now);
+
+      requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
